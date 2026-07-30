@@ -11,8 +11,6 @@ import { randomUUID } from "node:crypto";
 import { getAsset, isSea } from "node:sea";
 import { commandAt, normalizePlayerState, sanitizeDevice, summarizePlayers } from "./lib/sync.js";
 import { CommandTracker } from "./lib/command-tracker.js";
-import { CueList } from "./lib/cues.js";
-import { DeviceDiagnostics } from "./lib/device-diagnostics.js";
 import {
   MAX_SCENES,
   applyScene,
@@ -31,16 +29,12 @@ const dataDir = process.env.SYNC_CUE_DATA_DIR
 const uploadDir = isSea() ? join(dataDir, "uploads") : dataDir;
 const statePath = join(dataDir, "state.json");
 const scenesPath = join(dataDir, "scenes.json");
-const cuesPath = join(dataDir, "cues.json");
 mkdirSync(uploadDir, { recursive: true });
 
 const devices = loadDevices();
 const scenes = loadScenes();
-const cueList = loadCues();
 const playerSockets = new Map();
 const commandTracker = new CommandTracker();
-const diagnostics = new DeviceDiagnostics({ staleMs: 15000 });
-let cueCursorId;
 
 const app = express();
 const server = createServer(app);
@@ -96,13 +90,8 @@ const upload = multer({
 
 function publicState() {
   return {
-    devices: [...devices.values()].map((device) => ({
-      ...device,
-      diagnostics: diagnostics.snapshot(device.name)
-    })),
+    devices: [...devices.values()],
     scenes: scenes.map(({ name }) => ({ name })),
-    cues: cueList.list(),
-    cueCursorId,
     playerBaseUrl: `${getLanOrigin()}/?mode=player&device=`
   };
 }
@@ -127,9 +116,9 @@ function deliverCommand({ id, command, at, device }) {
   commandTracker.markSent(id, device);
 }
 
-function issueCommand(command, extraDelayMs = 0) {
+function issueCommand(command) {
   const baseDelay = command === "play" ? 2500 : 400;
-  const at = commandAt(Date.now(), baseDelay + Math.max(0, Number(extraDelayMs) || 0));
+  const at = commandAt(Date.now(), baseDelay);
   const id = randomUUID();
   commandTracker.issue({
     id,
@@ -194,19 +183,6 @@ function persistScenes() {
   writeFileSync(scenesPath, serializeScenes(scenes));
 }
 
-function loadCues() {
-  try {
-    const saved = JSON.parse(readFileSync(cuesPath, "utf8"));
-    return new CueList(saved.cues || [], { createId: randomUUID });
-  } catch {
-    return new CueList([], { createId: randomUUID });
-  }
-}
-
-function persistCues() {
-  writeFileSync(cuesPath, JSON.stringify(cueList));
-}
-
 function getLanOrigin() {
   const candidates = Object.entries(networkInterfaces())
     .flatMap(([name, addresses]) => (addresses ?? []).map((address) => ({ name, ...address })))
@@ -257,7 +233,6 @@ app.patch("/api/devices/:name", (req, res) => {
 app.delete("/api/devices/:name", (req, res) => {
   const name = sanitizeDevice(req.params.name);
   if (!devices.delete(name)) return res.status(404).json({ error: "Device not found" });
-  diagnostics.remove(name);
   persistDevices();
   publishState();
   res.sendStatus(204);
@@ -330,53 +305,6 @@ app.delete("/api/scenes/:name", (req, res) => {
   res.sendStatus(204);
 });
 
-app.post("/api/cues", (req, res) => {
-  try {
-    const cue = cueList.add({ action: req.body.action, delayMs: Number(req.body.delayMs) || 0 });
-    persistCues();
-    publishState();
-    res.status(201).json(cue);
-  } catch (error) {
-    res.status(400).json({ error: error.message });
-  }
-});
-
-app.patch("/api/cues/:id", (req, res) => {
-  try {
-    if (!cueList.reorder(req.params.id, Number(req.body.index))) {
-      return res.status(404).json({ error: "Cue not found" });
-    }
-    persistCues();
-    publishState();
-    res.json(cueList.list());
-  } catch (error) {
-    res.status(400).json({ error: error.message });
-  }
-});
-
-app.delete("/api/cues/:id", (req, res) => {
-  if (!cueList.remove(req.params.id)) return res.status(404).json({ error: "Cue not found" });
-  if (cueCursorId === req.params.id) cueCursorId = undefined;
-  persistCues();
-  publishState();
-  res.sendStatus(204);
-});
-
-app.post("/api/cues/next", (_req, res) => {
-  const cue = cueList.next(cueCursorId);
-  if (!cue) return res.status(409).json({ error: "End of cue list" });
-  cueCursorId = cue.id;
-  const issued = issueCommand(cue.action, cue.delayMs);
-  publishState();
-  res.json({ cue, issued });
-});
-
-app.post("/api/cues/reset", (_req, res) => {
-  cueCursorId = undefined;
-  publishState();
-  res.sendStatus(204);
-});
-
 app.post("/api/command/:command", (req, res) => {
   const allowed = new Set(["play", "pause", "reset"]);
   if (!allowed.has(req.params.command)) return res.sendStatus(400);
@@ -444,22 +372,6 @@ wss.on("connection", (socket) => {
       });
     }
 
-    if (message.type === "telemetry" && assignedDevice) {
-      if (message.kind === "clock") {
-        diagnostics.recordClock(assignedDevice, message);
-      }
-      if (message.kind === "startup") {
-        diagnostics.recordStartup(assignedDevice, message);
-      }
-      if (message.kind === "playback") {
-        diagnostics.recordPlayback(assignedDevice, message);
-      }
-      broadcast({
-        type: "diagnostics",
-        device: assignedDevice,
-        diagnostics: diagnostics.snapshot(assignedDevice)
-      });
-    }
   });
 
   socket.on("close", () => {
