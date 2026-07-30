@@ -11,7 +11,7 @@ const mode = params.get("mode") || "control";
 const deviceName = params.get("device") || "";
 const protocol = location.protocol === "https:" ? "wss:" : "ws:";
 
-let state = { devices: [], playerBaseUrl: "" };
+let state = { devices: [], scenes: [], cues: [], playerBaseUrl: "" };
 let clockOffset = 0;
 let syncSamples = [];
 let socket;
@@ -53,6 +53,11 @@ function connectSocket() {
     }
     if (message.type === "sync") handleSync(message);
     if (message.type === "command" && mode === "player") runCommand(message);
+    if (message.type === "diagnostics" && mode === "control") {
+      const device = state.devices.find((item) => item.name === message.device);
+      if (device) device.diagnostics = message.diagnostics;
+      updateDiagnostics(message.device);
+    }
   });
 
   connection.addEventListener("close", () => {
@@ -81,15 +86,18 @@ function syncClock(connection, iteration = 0) {
 function handleSync(message) {
   const receivedAt = Date.now();
   const rtt = receivedAt - message.clientSentAt;
+  const offset = message.serverTime - (message.clientSentAt + rtt / 2);
   syncSamples.push({
     rtt,
-    offset: message.serverTime - (message.clientSentAt + rtt / 2)
+    offset
   });
   const best = [...syncSamples].sort((a, b) => a.rtt - b.rtt).slice(0, 3);
   clockOffset = Math.round(best.reduce((sum, sample) => sum + sample.offset, 0) / best.length);
+  if (mode === "player") sendSocket({ type: "telemetry", kind: "clock", rttMs: rtt, offsetMs: offset });
 }
 
 function renderController() {
+  const helpOpen = app.querySelector(".interface-help")?.open;
   const participants = state.devices.filter((device) => device.media);
   const canPlay = participants.length > 0 && participants.every((device) => device.ready);
   const connected = socket?.readyState === WebSocket.OPEN;
@@ -104,6 +112,18 @@ function renderController() {
         <button data-command="pause">Пауза</button>
         <button data-command="reset">Сброс</button>
       </div>
+      <details class="interface-help" ${helpOpen ? "open" : ""}>
+        <summary>Как пользоваться</summary>
+        <div class="help-grid">
+          <div><strong>QR</strong><span>Откройте плеер устройства и нажмите «Подготовить».</span></div>
+          <div><strong>Старт</strong><span>Одновременно запускает все устройства со статусом «Готов».</span></div>
+          <div><strong>Пауза</strong><span>Останавливает воспроизведение на всех устройствах.</span></div>
+          <div><strong>Сброс</strong><span>Ставит все ролики на начало.</span></div>
+          <div><strong>Поправка</strong><span>Минус запускает устройство раньше, плюс — позже.</span></div>
+          <div><strong>Сцена</strong><span>Сохраняет выбранные видео и поправки устройств.</span></div>
+          <div><strong>Cue</strong><span>Запускает подготовленную последовательность команд.</span></div>
+        </div>
+      </details>
       <div class="device-list">
         ${state.devices.map(deviceCard).join("")}
       </div>
@@ -111,6 +131,42 @@ function renderController() {
         <input name="name" maxlength="40" placeholder="Название устройства" required>
         <button>Добавить</button>
       </form>
+      <section class="automation">
+        <div class="automation-section">
+          <div class="section-head">
+            <h2>Сцены</h2>
+          </div>
+          <form class="scene-form compact-form">
+            <input name="name" maxlength="40" placeholder="Название сцены" required>
+            <button>Сохранить</button>
+          </form>
+          <div class="scene-list">
+            ${(state.scenes || []).map(sceneRow).join("") || '<span class="empty-state">Нет сохранённых сцен</span>'}
+          </div>
+        </div>
+        <div class="automation-section">
+          <div class="section-head">
+            <h2>Cue-лист</h2>
+            <div class="cue-controls">
+              <button class="cue-next" ${(state.cues || []).length ? "" : "disabled"}>Следующий</button>
+              <button class="cue-reset" title="Вернуться к первому cue" aria-label="Вернуться к первому cue">↺</button>
+            </div>
+          </div>
+          <form class="cue-form compact-form">
+            <select name="action">
+              <option value="play">Старт</option>
+              <option value="pause">Пауза</option>
+              <option value="reset">Сброс</option>
+            </select>
+            <input name="delayMs" type="number" min="0" max="3600000" step="100" value="0" aria-label="Задержка cue">
+            <span>мс</span>
+            <button>Добавить</button>
+          </form>
+          <div class="cue-list">
+            ${(state.cues || []).map(cueRow).join("") || '<span class="empty-state">Cue-лист пуст</span>'}
+          </div>
+        </div>
+      </section>
       <dialog class="qr-dialog">
         <button class="dialog-close" aria-label="Закрыть" title="Закрыть">×</button>
         <h2></h2>
@@ -138,6 +194,54 @@ function renderController() {
   });
   app.querySelector(".dialog-close").onclick = () => app.querySelector(".qr-dialog").close();
   app.querySelector(".add-device").onsubmit = addDevice;
+  app.querySelector(".scene-form").onsubmit = saveScene;
+  app.querySelectorAll(".scene-apply").forEach((button) => {
+    button.onclick = () => applyScene(button.dataset.scene);
+  });
+  app.querySelectorAll(".scene-delete").forEach((button) => {
+    button.onclick = () => deleteScene(button.dataset.scene);
+  });
+  app.querySelector(".cue-form").onsubmit = addCue;
+  app.querySelector(".cue-next").onclick = runNextCue;
+  app.querySelector(".cue-reset").onclick = resetCues;
+  app.querySelectorAll(".cue-delete").forEach((button) => {
+    button.onclick = () => deleteCue(button.dataset.cue);
+  });
+  app.querySelectorAll(".cue-move").forEach((button) => {
+    button.onclick = () => moveCue(button.dataset.cue, Number(button.dataset.index));
+  });
+}
+
+function sceneRow(scene) {
+  return `
+    <div class="scene-row">
+      <button class="scene-apply" data-scene="${escapeHtml(scene.name)}">${escapeHtml(scene.name)}</button>
+      <button class="icon-button scene-delete" data-scene="${escapeHtml(scene.name)}"
+        title="Удалить сцену" aria-label="Удалить сцену">×</button>
+    </div>
+  `;
+}
+
+function cueRow(cue, index) {
+  const active = cue.id === state.cueCursorId;
+  return `
+    <div class="cue-row ${active ? "active" : ""}">
+      <span class="cue-index">${index + 1}</span>
+      <span class="cue-name">${cueActionLabel(cue.action)}</span>
+      <span class="cue-delay">${cue.delayMs ? `+${cue.delayMs} мс` : "без задержки"}</span>
+      <button class="icon-button cue-move" data-cue="${cue.id}" data-index="${index - 1}"
+        title="Переместить выше" aria-label="Переместить выше" ${index ? "" : "disabled"}>↑</button>
+      <button class="icon-button cue-move" data-cue="${cue.id}" data-index="${index + 1}"
+        title="Переместить ниже" aria-label="Переместить ниже"
+        ${index < state.cues.length - 1 ? "" : "disabled"}>↓</button>
+      <button class="icon-button cue-delete" data-cue="${cue.id}"
+        title="Удалить cue" aria-label="Удалить cue">×</button>
+    </div>
+  `;
+}
+
+function cueActionLabel(action) {
+  return { play: "Старт", pause: "Пауза", reset: "Сброс" }[action] || action;
 }
 
 function deviceCard(device) {
@@ -151,9 +255,11 @@ function deviceCard(device) {
       <div class="device-body">
         <input class="file" data-device="${escapeHtml(device.name)}" type="file" accept="video/*">
         <span class="media-name">${device.media ? device.media.split("/").pop() : "Нет видео"}</span>
+        <span class="diagnostics" data-device="${escapeHtml(device.name)}"
+          data-status="${device.diagnostics?.status || ""}">${diagnosticsText(device.diagnostics)}</span>
       </div>
       <div class="device-foot">
-        <label class="calibration-wrap" title="Поправка старта">
+        <label class="calibration-wrap" title="Отрицательное значение запускает раньше, положительное — позже">
           <input class="calibration" data-device="${escapeHtml(device.name)}" type="number"
             min="-1000" max="1000" step="10" value="${device.calibrationMs}">
           <span>мс</span>
@@ -167,6 +273,25 @@ function deviceCard(device) {
       </div>
     </article>
   `;
+}
+
+function diagnosticsText(diagnostics) {
+  const metrics = diagnostics?.metrics;
+  if (!metrics) return "Диагностика: нет данных";
+  const values = [];
+  if (metrics.rttMs !== null) values.push(`RTT ${metrics.rttMs} мс`);
+  if (metrics.driftMs !== null) values.push(`drift ${metrics.driftMs > 0 ? "+" : ""}${metrics.driftMs} мс`);
+  if (metrics.bufferedSeconds !== null) values.push(`буфер ${metrics.bufferedSeconds} с`);
+  return values.length ? values.join(" · ") : "Диагностика: нет данных";
+}
+
+function updateDiagnostics(deviceName) {
+  const device = state.devices.find((item) => item.name === deviceName);
+  const element = [...app.querySelectorAll(".diagnostics")]
+    .find((item) => item.dataset.device === deviceName);
+  if (!device || !element) return;
+  element.textContent = diagnosticsText(device.diagnostics);
+  element.dataset.status = device.diagnostics?.status || "";
 }
 
 function deviceStatus(device) {
@@ -206,6 +331,63 @@ async function addDevice(event) {
   event.currentTarget.reset();
 }
 
+async function saveScene(event) {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const response = await fetch("/api/scenes", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name: new FormData(form).get("name") })
+  });
+  if (response.ok) form.reset();
+  else alert("Не удалось сохранить сцену");
+}
+
+async function applyScene(scene) {
+  const response = await fetch(`/api/scenes/${encodeURIComponent(scene)}/apply`, { method: "POST" });
+  if (!response.ok) alert("Не удалось применить сцену");
+}
+
+async function deleteScene(scene) {
+  await fetch(`/api/scenes/${encodeURIComponent(scene)}`, { method: "DELETE" });
+}
+
+async function addCue(event) {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const data = new FormData(form);
+  const response = await fetch("/api/cues", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      action: data.get("action"),
+      delayMs: Number(data.get("delayMs"))
+    })
+  });
+  if (!response.ok) alert("Не удалось добавить cue");
+}
+
+async function moveCue(cue, index) {
+  await fetch(`/api/cues/${encodeURIComponent(cue)}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ index })
+  });
+}
+
+async function deleteCue(cue) {
+  await fetch(`/api/cues/${encodeURIComponent(cue)}`, { method: "DELETE" });
+}
+
+async function runNextCue() {
+  const response = await fetch("/api/cues/next", { method: "POST" });
+  if (response.status === 409) alert("Конец cue-листа");
+}
+
+async function resetCues() {
+  await fetch("/api/cues/reset", { method: "POST" });
+}
+
 function showQr(device) {
   const dialog = app.querySelector(".qr-dialog");
   const url = `${state.playerBaseUrl}${encodeURIComponent(device)}`;
@@ -238,6 +420,8 @@ let playRequestedAt;
 let startLatencySamples = loadStartLatencySamples();
 let pendingCommandId;
 const commandResults = new Map();
+let buffering = false;
+let hardCorrectionPending = false;
 
 function renderPlayer() {
   app.innerHTML = `
@@ -258,7 +442,10 @@ function renderPlayer() {
   app.querySelector(".arm").onclick = armPlayer;
   app.querySelector(".fullscreen").onclick = enterFullscreen;
   video.addEventListener("loadstart", () => reportPlayerState("loading"));
-  video.addEventListener("canplay", () => reportPlayerState(armed ? "ready" : "loaded"));
+  video.addEventListener("canplay", () => {
+    buffering = false;
+    reportPlayerState(armed ? "ready" : "loaded");
+  });
   video.addEventListener("playing", () => {
     if (playRequestedAt !== undefined) {
       rememberStartLatency(performance.now() - playRequestedAt);
@@ -267,12 +454,16 @@ function renderPlayer() {
     armed = true;
     app.querySelector(".player").classList.add("armed");
     reportPlayerState("playing");
-    correctDrift();
+    runDriftCorrection();
   });
   video.addEventListener("pause", () => {
     if (currentMedia) reportPlayerState(armed ? "paused" : "loaded");
   });
-  video.addEventListener("waiting", () => reportPlayerState("loading"));
+  video.addEventListener("waiting", () => {
+    buffering = true;
+    video.playbackRate = 1;
+    reportPlayerState("loading");
+  });
   video.addEventListener("ended", () => {
     stopDriftCorrection();
     reportPlayerState(armed ? "ended" : "loaded");
@@ -333,6 +524,7 @@ function loadStartLatencySamples() {
 function rememberStartLatency(latencyMs) {
   if (!Number.isFinite(latencyMs) || latencyMs < 0 || latencyMs > 2000) return;
   startLatencySamples = [...startLatencySamples.slice(-6), Math.round(latencyMs)];
+  sendSocket({ type: "telemetry", kind: "startup", lagMs: latencyMs });
   try {
     localStorage.setItem(`sync-cue-latency:${deviceName}`, JSON.stringify(startLatencySamples));
   } catch {}
@@ -506,17 +698,30 @@ function sendCommandAck(id, result) {
 
 function startDriftCorrection() {
   stopDriftCorrection();
-  correctDrift();
-  driftTimer = setInterval(correctDrift, 200);
+  hardCorrectionPending = true;
+  runDriftCorrection();
+  driftTimer = setInterval(runDriftCorrection, 1000);
 }
 
 function stopDriftCorrection() {
   clearInterval(driftTimer);
   driftTimer = undefined;
+  hardCorrectionPending = false;
 }
 
-function correctDrift() {
-  if (!timelineStartAt || !video || video.paused || video.seeking) return;
+function runDriftCorrection() {
+  if (correctDrift(hardCorrectionPending)) hardCorrectionPending = false;
+}
+
+function correctDrift(allowSeek = false) {
+  if (
+    !timelineStartAt
+    || !video
+    || video.paused
+    || video.seeking
+    || buffering
+    || video.readyState < 3
+  ) return false;
   const expected = expectedCurrentTime({
     now: Date.now(),
     startAt: timelineStartAt,
@@ -526,14 +731,31 @@ function correctDrift() {
   const correction = decideDriftCorrection({
     actualCurrentTime: video.currentTime,
     expectedCurrentTime: expected,
-    rateThresholdMs: 35,
-    seekThresholdMs: 180,
-    correctionWindowMs: 1200,
-    minRate: 0.9,
-    maxRate: 1.1
+    rateThresholdMs: 80,
+    seekThresholdMs: allowSeek ? 400 : Number.MAX_SAFE_INTEGER,
+    correctionWindowMs: 6000,
+    minRate: 0.97,
+    maxRate: 1.03
+  });
+  sendSocket({
+    type: "telemetry",
+    kind: "playback",
+    driftMs: correction.driftMs,
+    bufferedSeconds: bufferedSeconds(),
+    readyState: video.readyState
   });
   video.playbackRate = correction.playbackRate;
   if (correction.action === "seek") video.currentTime = correction.seekTo;
+  return true;
+}
+
+function bufferedSeconds() {
+  for (let index = 0; index < video.buffered.length; index += 1) {
+    if (video.buffered.start(index) <= video.currentTime && video.buffered.end(index) >= video.currentTime) {
+      return Math.max(0, video.buffered.end(index) - video.currentTime);
+    }
+  }
+  return 0;
 }
 
 function escapeHtml(value) {

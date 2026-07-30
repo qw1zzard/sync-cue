@@ -32,7 +32,8 @@ h1 { margin: 0; font-size: 24px; letter-spacing: 0; }
   border-block: 1px solid #292b2f;
 }
 
-.transport button, .add-device button, .arm, .fullscreen {
+.transport button, .add-device button, .compact-form button, .cue-controls button,
+.scene-apply, .arm, .fullscreen {
   border: 1px solid #383b40;
   border-radius: 6px;
   background: #202226;
@@ -43,6 +44,27 @@ h1 { margin: 0; font-size: 24px; letter-spacing: 0; }
 
 .transport .play { background: #f0cf49; color: #171717; border-color: #f0cf49; font-weight: 700; }
 .transport .play:disabled { opacity: .4; cursor: not-allowed; }
+
+.interface-help {
+  padding: 14px 0;
+  border-bottom: 1px solid #292b2f;
+  color: #c7c9cd;
+  font-size: 13px;
+}
+.interface-help summary {
+  width: fit-content;
+  cursor: pointer;
+  color: #f5f5f2;
+  font-weight: 600;
+}
+.help-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px 24px;
+  margin-top: 14px;
+}
+.help-grid div { display: grid; grid-template-columns: 74px 1fr; gap: 8px; }
+.help-grid strong { color: #f5f5f2; }
 
 .device-list {
   display: grid;
@@ -89,6 +111,10 @@ h1 { margin: 0; font-size: 24px; letter-spacing: 0; }
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.diagnostics { color: #777b82; font-size: 11px; }
+.diagnostics[data-status="healthy"] { color: #70d594; }
+.diagnostics[data-status="warning"] { color: #e5c75c; }
+.diagnostics[data-status="error"] { color: #e79090; }
 
 .device-foot { justify-content: space-between; gap: 16px; margin-top: 12px; }
 .calibration-wrap {
@@ -128,6 +154,62 @@ h1 { margin: 0; font-size: 24px; letter-spacing: 0; }
   color: inherit;
   padding: 0 12px;
 }
+
+.automation {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 28px;
+  margin-top: 28px;
+  padding-top: 24px;
+  border-top: 1px solid #292b2f;
+}
+.automation-section { min-width: 0; }
+.section-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.section-head h2 { margin: 0; font-size: 17px; }
+.compact-form {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 14px;
+}
+.compact-form input, .compact-form select {
+  min-width: 0;
+  height: 42px;
+  border: 1px solid #383b40;
+  border-radius: 5px;
+  background: #101113;
+  color: inherit;
+  padding: 0 10px;
+}
+.compact-form input[name="name"] { flex: 1; }
+.cue-form input { width: 100px; }
+.cue-form span { color: #909399; font-size: 12px; }
+.scene-list, .cue-list { display: grid; gap: 6px; margin-top: 12px; }
+.scene-row, .cue-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 40px;
+  border-bottom: 1px solid #25272b;
+  padding: 4px 0;
+}
+.scene-apply {
+  flex: 1;
+  min-width: 0;
+  text-align: left;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cue-controls { display: flex; gap: 6px; }
+.cue-controls button { min-height: 36px; padding: 0 12px; }
+.cue-controls button:disabled, .icon-button:disabled { opacity: .35; cursor: not-allowed; }
+.cue-row.active { color: #70d594; }
+.cue-index { width: 22px; color: #777b82; font-size: 12px; }
+.cue-name { width: 60px; }
+.cue-delay { flex: 1; color: #909399; font-size: 12px; }
+.cue-row .icon-button, .scene-row .icon-button { flex: 0 0 32px; width: 32px; height: 32px; }
+.empty-state { color: #777b82; font-size: 13px; padding: 8px 0; }
 
 .qr-dialog {
   width: min(390px, calc(100% - 32px));
@@ -189,10 +271,16 @@ h1 { margin: 0; font-size: 24px; letter-spacing: 0; }
 }
 
 @media (max-width: 700px) {
-  .controller { width: min(100% - 20px, 1100px); padding-top: 18px; }
-  .transport { display: grid; grid-template-columns: 1fr 1fr 1fr; }
-  .transport button { padding: 0 8px; }
+  .controller { width: calc(100% - 20px); max-width: 1100px; padding-top: 18px; }
+  .transport { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .transport button { min-width: 0; padding: 0 8px; }
   .device-list { grid-template-columns: 1fr; }
+  .device { width: 100%; }
+  .device-actions { flex: 0 0 auto; }
+  .help-grid { grid-template-columns: 1fr; }
+  .automation { grid-template-columns: 1fr; }
+  .compact-form { flex-wrap: wrap; }
+  .cue-form select { flex: 1; }
   .add-device input { min-width: 0; flex: 1; }
 }
 
