@@ -1,4 +1,4 @@
 node_modules/
-uploads/
-npm-debug.log*
 dist/
+SyncCue.exe
+SyncCueData/

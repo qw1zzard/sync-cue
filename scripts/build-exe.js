@@ -1,16 +1,31 @@
 import { build } from "esbuild";
 import { execFileSync } from "node:child_process";
-import { copyFileSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, cpSync, existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 const root = join(import.meta.dirname, "..");
 const dist = join(root, "dist");
 const bundle = join(dist, "server.cjs");
 const blob = join(dist, "sync-cue.blob");
-const executable = join(dist, "SyncCue.exe");
+const executable = join(root, "SyncCue.exe");
 const seaConfig = join(dist, "sea-config.json");
+const dataDir = join(root, "SyncCueData");
+const legacyDataDir = join(dist, "SyncCueData");
 
-rmSync(dist, { recursive: true, force: true });
+try {
+  if (existsSync(legacyDataDir) && !existsSync(dataDir)) {
+    cpSync(legacyDataDir, dataDir, { recursive: true });
+  }
+  rmSync(executable, { force: true });
+  rmSync(dist, { recursive: true, force: true });
+} catch (error) {
+  if (error.code === "EPERM" || error.code === "EBUSY") {
+    console.error("Cannot rebuild SyncCue.exe while it is running.");
+    console.error("Close SyncCue.exe and run npm run build:exe again.");
+    process.exit(1);
+  }
+  throw error;
+}
 mkdirSync(dist);
 
 await build({
@@ -31,7 +46,8 @@ writeFileSync(seaConfig, JSON.stringify({
   assets: {
     "index.html": join(root, "public", "index.html"),
     "styles.css": join(root, "public", "styles.css"),
-    "app.js": join(root, "public", "app.js")
+    "app.js": join(root, "public", "app.js"),
+    "playback-timing.js": join(root, "lib", "playback-timing.js")
   }
 }));
 
@@ -49,5 +65,6 @@ execFileSync(process.execPath, [
 rmSync(bundle);
 rmSync(blob);
 rmSync(seaConfig);
+rmSync(dist, { recursive: true, force: true });
 
 console.log(executable);

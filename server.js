@@ -7,8 +7,10 @@ import { mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "
 import { networkInterfaces } from "node:os";
 import { dirname, extname, join } from "node:path";
 import { execFile } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { getAsset, isSea } from "node:sea";
-import { commandAt, sanitizeDevice } from "./lib/sync.js";
+import { commandAt, normalizePlayerState, sanitizeDevice, summarizePlayers } from "./lib/sync.js";
+import { CommandTracker } from "./lib/command-tracker.js";
 
 const port = Number(process.env.PORT || 4173);
 const host = process.env.HOST || "0.0.0.0";
@@ -19,10 +21,28 @@ const statePath = join(dataDir, "state.json");
 mkdirSync(uploadDir, { recursive: true });
 
 const devices = loadDevices();
+const playerSockets = new Map();
+const commandTracker = new CommandTracker();
 
 const app = express();
 const server = createServer(app);
 const wss = new WebSocketServer({ server });
+let listenErrorHandled = false;
+
+function handleListenError(error) {
+  if (listenErrorHandled) return;
+  listenErrorHandled = true;
+  if (error.code === "EADDRINUSE") {
+    console.error(`Sync Cue is already running or port ${port} is in use.`);
+    console.error(`Close the other instance or set a different PORT.`);
+  } else {
+    console.error(`Failed to start Sync Cue: ${error.message}`);
+  }
+  setImmediate(() => process.exit(1));
+}
+
+server.on("error", handleListenError);
+wss.on("error", handleListenError);
 
 app.use(express.json());
 if (isSea()) {
@@ -30,7 +50,8 @@ if (isSea()) {
     ["/", ["index.html", "text/html; charset=utf-8"]],
     ["/index.html", ["index.html", "text/html; charset=utf-8"]],
     ["/styles.css", ["styles.css", "text/css; charset=utf-8"]],
-    ["/app.js", ["app.js", "text/javascript; charset=utf-8"]]
+    ["/app.js", ["app.js", "text/javascript; charset=utf-8"]],
+    ["/playback-timing.js", ["playback-timing.js", "text/javascript; charset=utf-8"]]
   ]);
   app.get([...assets.keys()], (req, res) => {
     const [key, contentType] = assets.get(req.path);
@@ -38,6 +59,9 @@ if (isSea()) {
   });
 } else {
   app.use(express.static(join(root, "public")));
+  app.get("/playback-timing.js", (_req, res) => {
+    res.sendFile(join(root, "lib", "playback-timing.js"));
+  });
 }
 app.use("/media", express.static(uploadDir, {
   acceptRanges: true,
@@ -70,6 +94,25 @@ function publishState() {
   broadcast({ type: "state", state: publicState() });
 }
 
+function deliverCommand({ id, command, at, device }) {
+  const sockets = [...(playerSockets.get(device) || [])]
+    .filter((socket) => socket.readyState === WebSocket.OPEN);
+  if (!sockets.length) return;
+  const payload = JSON.stringify({ type: "command", id, command, at });
+  for (const socket of sockets) socket.send(payload);
+  commandTracker.markSent(id, device);
+}
+
+function updatePresence(name) {
+  const device = devices.get(name);
+  if (!device) return;
+  const sockets = [...(playerSockets.get(name) || [])];
+  Object.assign(device, summarizePlayers(sockets.map((socket) => ({
+    state: socket.playerState,
+    ready: socket.playerReady
+  }))));
+}
+
 function loadDevices() {
   const defaults = ["TV", "Laptop", "Phone"].map((name) => ({
     name,
@@ -85,6 +128,7 @@ function loadDevices() {
     media: device.media || null,
     connected: false,
     ready: false,
+    playbackState: "offline",
     calibrationMs: Number(device.calibrationMs) || 0
   }]));
 }
@@ -122,7 +166,14 @@ app.post("/api/devices", (req, res) => {
   const name = sanitizeDevice(req.body.name);
   if (!name) return res.status(400).json({ error: "Invalid device name" });
   if (!devices.has(name)) {
-    devices.set(name, { name, media: null, connected: false, ready: false, calibrationMs: 0 });
+    devices.set(name, {
+      name,
+      media: null,
+      connected: false,
+      ready: false,
+      playbackState: "offline",
+      calibrationMs: 0
+    });
     persistDevices();
   }
   publishState();
@@ -159,6 +210,7 @@ app.post("/api/upload/:name", upload.single("video"), (req, res) => {
   renameSync(req.file.path, join(uploadDir, filename));
   device.media = `/media/${filename}`;
   device.ready = false;
+  device.playbackState = device.connected ? "loading" : "offline";
   persistDevices();
   publishState();
   res.json(device);
@@ -175,12 +227,28 @@ app.post("/api/command/:command", (req, res) => {
   const allowed = new Set(["play", "pause", "reset"]);
   if (!allowed.has(req.params.command)) return res.sendStatus(400);
   const at = commandAt(Date.now(), req.params.command === "play" ? 2500 : 400);
-  broadcast({ type: "command", command: req.params.command, at });
-  res.json({ command: req.params.command, at });
+  const id = randomUUID();
+  commandTracker.issue({
+    id,
+    command: req.params.command,
+    at,
+    devices: [...devices.values()]
+      .filter((device) => device.media && device.connected)
+      .map((device) => device.name)
+  });
+  for (const candidate of commandTracker.retryCandidates()) deliverCommand(candidate);
+  res.json({ id, command: req.params.command, at });
 });
 
 wss.on("connection", (socket) => {
   let assignedDevice = null;
+  socket.isAlive = true;
+  socket.playerReady = false;
+  socket.playerState = "loading";
+
+  socket.on("pong", () => {
+    socket.isAlive = true;
+  });
 
   socket.on("message", (raw) => {
     let message;
@@ -194,8 +262,14 @@ wss.on("connection", (socket) => {
       const name = sanitizeDevice(message.device);
       if (message.role === "player" && devices.has(name)) {
         assignedDevice = name;
-        devices.get(name).connected = true;
-        devices.get(name).ready = false;
+        socket.playerReady = Boolean(message.ready);
+        socket.playerState = normalizePlayerState(message.playerState);
+        if (!playerSockets.has(name)) playerSockets.set(name, new Set());
+        playerSockets.get(name).add(socket);
+        updatePresence(name);
+        for (const candidate of commandTracker.retryCandidates().filter((item) => item.device === name)) {
+          deliverCommand(candidate);
+        }
       }
       socket.send(JSON.stringify({ type: "state", state: publicState() }));
       publishState();
@@ -210,20 +284,52 @@ wss.on("connection", (socket) => {
       }));
     }
 
-    if (message.type === "ready" && assignedDevice) {
-      devices.get(assignedDevice).ready = Boolean(message.ready);
+    if ((message.type === "ready" || message.type === "player-state") && assignedDevice) {
+      socket.playerReady = Boolean(message.ready);
+      socket.playerState = normalizePlayerState(message.state || (message.ready ? "ready" : "loading"));
+      updatePresence(assignedDevice);
       publishState();
+    }
+
+    if (message.type === "command-ack" && assignedDevice) {
+      commandTracker.acknowledge({
+        id: message.id,
+        device: assignedDevice,
+        phase: message.phase,
+        ok: message.ok !== false,
+        error: message.error
+      });
     }
   });
 
   socket.on("close", () => {
     if (!assignedDevice) return;
-    const device = devices.get(assignedDevice);
-    if (!device) return;
-    device.connected = false;
-    device.ready = false;
+    const sockets = playerSockets.get(assignedDevice);
+    sockets?.delete(socket);
+    if (!sockets?.size) playerSockets.delete(assignedDevice);
+    updatePresence(assignedDevice);
     publishState();
   });
+});
+
+const heartbeat = setInterval(() => {
+  for (const socket of wss.clients) {
+    if (!socket.isAlive) {
+      socket.terminate();
+      continue;
+    }
+    socket.isAlive = false;
+    socket.ping();
+  }
+}, 15000);
+
+const commandRetry = setInterval(() => {
+  for (const candidate of commandTracker.retryCandidates()) deliverCommand(candidate);
+}, 100);
+
+server.on("close", () => {
+  clearInterval(heartbeat);
+  clearInterval(commandRetry);
 });
 
 server.listen(port, host, () => {

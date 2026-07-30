@@ -1,6 +1,12 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { commandAt, estimateClockOffset, sanitizeDevice } from "../lib/sync.js";
+import {
+  commandAt,
+  estimateClockOffset,
+  normalizePlayerState,
+  sanitizeDevice,
+  summarizePlayers
+} from "../lib/sync.js";
 
 test("device names are safe and bounded", () => {
   assert.equal(sanitizeDevice(" TV/../../ 1 "), "TV 1");
@@ -19,4 +25,25 @@ test("clock offset ignores slow samples", () => {
 
 test("commands are scheduled in the future", () => {
   assert.equal(commandAt(1000, 2500), 3500);
+});
+
+test("player state is normalized", () => {
+  assert.equal(normalizePlayerState("playing"), "playing");
+  assert.equal(normalizePlayerState("unknown"), "loading");
+});
+
+test("player connections are summarized", () => {
+  assert.deepEqual(summarizePlayers([]), {
+    connected: false,
+    ready: false,
+    playbackState: "offline"
+  });
+  assert.deepEqual(summarizePlayers([
+    { state: "playing", ready: true },
+    { state: "loaded", ready: false }
+  ]), {
+    connected: true,
+    ready: false,
+    playbackState: "loaded"
+  });
 });

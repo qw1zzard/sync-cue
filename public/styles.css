@@ -62,6 +62,9 @@ h1 { margin: 0; font-size: 24px; letter-spacing: 0; }
 .status { font-size: 13px; color: #909399; }
 .status.ready { color: #70d594; }
 .status.loading { color: #f0cf49; }
+.status.loaded { color: #9db7db; }
+.status.playing { color: #70d594; }
+.status.error { color: #e79090; }
 
 .device-body {
   display: grid;
@@ -156,6 +159,7 @@ h1 { margin: 0; font-size: 24px; letter-spacing: 0; }
 }
 
 .player video { width: 100%; height: 100%; object-fit: contain; }
+.player.prestarting video { opacity: 0; }
 .player-overlay {
   position: absolute;
   inset: 0;
